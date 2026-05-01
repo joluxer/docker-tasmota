@@ -162,8 +162,22 @@ if [[ $# -gt 0 ]]; then
     echo -e "Output files:"
     for target in "$@"; do
         src_pattern="${TASMOTA_DIR}/build_output/firmware/${target}"
+        map_pattern="${TASMOTA_DIR}/build_output/map/${target}"
         copied=0
-        for src_file in "${src_pattern}"*.bin "${src_pattern}"*.bin.gz; do
+        src_files=()
+        mapfile -t src_files < <(
+          (
+            shopt -s nullglob
+            printf '%s\n' \
+              "${src_pattern}.bin" \
+              "${src_pattern}"-*.bin \
+              "${src_pattern}.bin.gz" \
+              "${src_pattern}"-*.bin.gz \
+              "${src_pattern}"*.elf \
+              "${map_pattern}"*.map*
+          ) | sort -u
+        )
+        for src_file in "${src_files[@]}"; do
             [[ -f "${src_file}" ]] || continue
             cp "${src_file}" "${SCRIPT_DIR}/"
             echo -e "  ${CHECK_MARK} $(basename "${src_file}")"

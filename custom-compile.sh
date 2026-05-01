@@ -1,11 +1,15 @@
 #!/bin/bash
-# custom-compile.sh — Docker-Tasmota build wrapper without Git logic
+# custom-compile.sh — Tasmota build wrapper
+#
+# When the Toolchain directory is present, builds run via a persistent Docker
+# container using the XBC toolchain system (xbcstrt.sh / xbld.sh).
+# Without the Toolchain directory, falls back to a simple ephemeral docker run.
 #
 # Prerequisites:
-#   - The Tasmota repo is already cloned and checked out to the desired
-#     state under ./Tasmota/ (relative to the directory of this script)
+#   - The Tasmota repo is already cloned under $TASMOTA_DIR
 #   - user_config_override.h and/or platformio_override.ini are placed
 #     in the same directory as this script
+#   - Docker is installed and running
 #
 # Usage:
 #   ./custom-compile.sh tasmota tasmota-sensors   # one or more targets
@@ -13,19 +17,30 @@
 #
 # Environment variables (optional, set before invoking):
 #   DOCKER_IMAGE   — alternative Docker image (default: blakadder/docker-tasmota)
+#   TASMOTA_DIR    — Tasmota repo directory (default: $SCRIPT_DIR/Tasmota)
+#   XBCRUNMIN      — container timeout in minutes (default: 240, XBC mode only)
 #   USE_TEE=1      — write output to terminal AND log file simultaneously
 
 set -euo pipefail
 
-# --- Konfiguration -----------------------------------------------------------
+# --- XBC configuration -------------------------------------------------------
+
+SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
+PROGDIR="$SCRIPT_DIR/Toolchain"
+
+export BUILDER_IMAGE="${DOCKER_IMAGE:-blakadder/docker-tasmota}"
+export XBPROJECT_ROOT="$SCRIPT_DIR"
+export XBCPREFIX="tasmota-build"
+export XBCRUNMIN="${XBCRUNMIN:-240}"
+export CBMOUNTS="tasmota-build.mounts"
+export XBC_VOLUMES="auto:target=$HOME/.platformio"
+
+# --- Project configuration ---------------------------------------------------
 
 CHECK_MARK="\033[0;32m\xE2\x9C\x94\033[0m"
 
-SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
-TASMOTA_DIR="${SCRIPT_DIR}/Tasmota"
+TASMOTA_DIR="${TASMOTA_DIR:-${SCRIPT_DIR}/Tasmota}"
 LOG_FILE="${SCRIPT_DIR}/docker-tasmota.log"
-
-DOCKER_IMAGE="${DOCKER_IMAGE:-blakadder/docker-tasmota}"
 
 # --- Check prerequisites -----------------------------------------------------
 
@@ -76,42 +91,66 @@ if [[ -f "${SCRIPT_DIR}/platformio_override.ini" ]]; then
     echo -e "Using your platformio_override.ini and overwriting the existing file\n"
 fi
 
-# --- Docker invocation -------------------------------------------------------
+# --- Run build ---------------------------------------------------------------
 
-# Enable TTY only when running in an interactive terminal
-DOCKER_TTY=""
-[[ -t 1 ]] && DOCKER_TTY="-it"
+echo "Compiling..."
 
-DOCKER_BASE=(
-    docker run
-    ${DOCKER_TTY}
-    --rm
-    -v "${TASMOTA_DIR}:/tasmota"
-    -e HOST_UID="${UID}"
-    -e HOST_GID="${GID:-$(id -g)}"
-    "${DOCKER_IMAGE}"
-)
-
-echo -n "Compiling..."
-
-if [[ $# -gt 0 ]]; then
-    # Pass targets as -e <target> -e <target> ...
-    TARGET_ARGS=()
-    for target in "$@"; do
-        TARGET_ARGS+=(-e "${target}")
-    done
-
-    if [[ "${USE_TEE:-0}" == "1" ]]; then
-        "${DOCKER_BASE[@]}" "${TARGET_ARGS[@]}" 2>&1 | tee "${LOG_FILE}"
+if [[ -d "$PROGDIR" ]]; then
+    # XBC mode: delegate to persistent container via xbld.sh
+    
+    export DOCKER_TTY=""
+    [[ -t 1 ]] && DOCKER_TTY="-t"
+    
+    if [[ $# -gt 0 ]]; then
+        TARGET_ARGS=()
+        for target in "$@"; do
+            TARGET_ARGS+=(-e "${target}")
+        done
+        
+        if [[ "${QUIET:-0}" != "1" ]]; then
+            "$PROGDIR/xbld.sh" pio run -d "${TASMOTA_DIR}" "${TARGET_ARGS[@]}" 2>&1 | tee "${LOG_FILE}"
+        else
+            "$PROGDIR/xbld.sh" pio run -d "${TASMOTA_DIR}" "${TARGET_ARGS[@]}" >"${LOG_FILE}" 2>&1
+        fi
     else
-        "${DOCKER_BASE[@]}" "${TARGET_ARGS[@]}" >"${LOG_FILE}" 2>&1
+        if [[ "${QUIET:-0}" != "1" ]]; then
+            "$PROGDIR/xbld.sh" pio run -d "${TASMOTA_DIR}" 2>&1 | tee "${LOG_FILE}"
+        else
+            "$PROGDIR/xbld.sh" pio run -d "${TASMOTA_DIR}" >"${LOG_FILE}" 2>&1
+        fi
     fi
 else
-    # Kein Target → alle Builds
-    if [[ "${USE_TEE:-0}" == "1" ]]; then
-        "${DOCKER_BASE[@]}" 2>&1 | tee "${LOG_FILE}"
+    # Fallback mode: ephemeral docker run, no Toolchain directory present
+    DOCKER_TTY=""
+    [[ -t 1 ]] && DOCKER_TTY="-it"
+
+    DOCKER_BASE=(
+        docker run
+        ${DOCKER_TTY}
+        --rm
+        -v "${TASMOTA_DIR}:/tasmota"
+        -e HOST_UID="${UID}"
+        -e HOST_GID="${GID:-$(id -g)}"
+        "${BUILDER_IMAGE}"
+    )
+
+    if [[ $# -gt 0 ]]; then
+        TARGET_ARGS=()
+        for target in "$@"; do
+            TARGET_ARGS+=(-e "${target}")
+        done
+
+        if [[ "${USE_TEE:-0}" == "1" ]]; then
+            "${DOCKER_BASE[@]}" "${TARGET_ARGS[@]}" 2>&1 | tee "${LOG_FILE}"
+        else
+            "${DOCKER_BASE[@]}" "${TARGET_ARGS[@]}" >"${LOG_FILE}" 2>&1
+        fi
     else
-        "${DOCKER_BASE[@]}" >"${LOG_FILE}" 2>&1
+        if [[ "${USE_TEE:-0}" == "1" ]]; then
+            "${DOCKER_BASE[@]}" 2>&1 | tee "${LOG_FILE}"
+        else
+            "${DOCKER_BASE[@]}" >"${LOG_FILE}" 2>&1
+        fi
     fi
 fi
 

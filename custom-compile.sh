@@ -25,22 +25,17 @@ set -euo pipefail
 
 # --- XBC configuration -------------------------------------------------------
 
-SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
-PROGDIR="$SCRIPT_DIR/Toolchain"
+PROGDIR=$(dirname "$(readlink -f "$0")")
+TOOLDIR="$PROGDIR/Toolchain"
 
-export BUILDER_IMAGE="${DOCKER_IMAGE:-blakadder/docker-tasmota}"
-export XBPROJECT_ROOT="$SCRIPT_DIR"
-export XBCPREFIX="tasmota-build"
-export XBCRUNMIN="${XBCRUNMIN:-240}"
-export CBMOUNTS="tasmota-build.mounts"
-export XBC_VOLUMES="auto:target=$HOME/.platformio"
+source "$PROGDIR/cbconfvars.sh"
 
 # --- Project configuration ---------------------------------------------------
 
 CHECK_MARK="\033[0;32m\xE2\x9C\x94\033[0m"
 
-TASMOTA_DIR="${TASMOTA_DIR:-${SCRIPT_DIR}/Tasmota}"
-LOG_FILE="${SCRIPT_DIR}/docker-tasmota.log"
+TASMOTA_DIR="${TASMOTA_DIR:-${PROGDIR}/Tasmota}"
+LOG_FILE="${PROGDIR}/docker-tasmota.log"
 
 # --- Check prerequisites -----------------------------------------------------
 
@@ -79,14 +74,14 @@ fi
 
 # --- Copy override files into repo -------------------------------------------
 
-if [[ -f "${SCRIPT_DIR}/user_config_override.h" ]]; then
-    cp "${SCRIPT_DIR}/user_config_override.h" \
+if [[ -f "${PROGDIR}/user_config_override.h" ]]; then
+    cp "${PROGDIR}/user_config_override.h" \
        "${TASMOTA_DIR}/tasmota/user_config_override.h"
     echo -e "Using your user_config_override.h and overwriting the existing file\n"
 fi
 
-if [[ -f "${SCRIPT_DIR}/platformio_override.ini" ]]; then
-    cp "${SCRIPT_DIR}/platformio_override.ini" \
+if [[ -f "${PROGDIR}/platformio_override.ini" ]]; then
+    cp "${PROGDIR}/platformio_override.ini" \
        "${TASMOTA_DIR}/platformio_override.ini"
     echo -e "Using your platformio_override.ini and overwriting the existing file\n"
 fi
@@ -95,7 +90,7 @@ fi
 
 echo "Compiling..."
 
-if [[ -d "$PROGDIR" ]]; then
+if [[ -d "$TOOLDIR" ]]; then
     # XBC mode: delegate to persistent container via xbld.sh
     
     export DOCKER_TTY=""
@@ -108,15 +103,15 @@ if [[ -d "$PROGDIR" ]]; then
         done
         
         if [[ "${QUIET:-0}" != "1" ]]; then
-            "$PROGDIR/xbld.sh" pio run -d "${TASMOTA_DIR}" "${TARGET_ARGS[@]}" 2>&1 | tee "${LOG_FILE}"
+            "$TOOLDIR/xbld.sh" pio run -d "${TASMOTA_DIR}" "${TARGET_ARGS[@]}" 2>&1 | tee "${LOG_FILE}"
         else
-            "$PROGDIR/xbld.sh" pio run -d "${TASMOTA_DIR}" "${TARGET_ARGS[@]}" >"${LOG_FILE}" 2>&1
+            "$TOOLDIR/xbld.sh" pio run -d "${TASMOTA_DIR}" "${TARGET_ARGS[@]}" >"${LOG_FILE}" 2>&1
         fi
     else
         if [[ "${QUIET:-0}" != "1" ]]; then
-            "$PROGDIR/xbld.sh" pio run -d "${TASMOTA_DIR}" 2>&1 | tee "${LOG_FILE}"
+            "$TOOLDIR/xbld.sh" pio run -d "${TASMOTA_DIR}" 2>&1 | tee "${LOG_FILE}"
         else
-            "$PROGDIR/xbld.sh" pio run -d "${TASMOTA_DIR}" >"${LOG_FILE}" 2>&1
+            "$TOOLDIR/xbld.sh" pio run -d "${TASMOTA_DIR}" >"${LOG_FILE}" 2>&1
         fi
     fi
 else
@@ -179,7 +174,7 @@ if [[ $# -gt 0 ]]; then
         )
         for src_file in "${src_files[@]}"; do
             [[ -f "${src_file}" ]] || continue
-            cp "${src_file}" "${SCRIPT_DIR}/"
+            cp "${src_file}" "${PROGDIR}/"
             echo -e "  ${CHECK_MARK} $(basename "${src_file}")"
             copied=1
         done

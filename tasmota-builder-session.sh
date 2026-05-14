@@ -6,17 +6,7 @@
 
 PROGDIR="$(dirname $(readlink -f "$0"))"
 
-# some fallbacks for undefined environment variables
-: ${BUILDER_IMAGE:="${DOCKER_IMAGE:-blakadder/docker-tasmota}"}
-: ${XBUILD_TARGET:=mcu}
-: ${XBPROJECT_ROOT:=$PROGDIR}
-: ${CBVARS_ENV:="$XBPROJECT_ROOT/ccodevars.env"}
-: ${XBCPREFIX:="tasmota-build"}
-: ${XBCRUNMIN:="720"}
-: ${XBC_VOLUMES:="auto:target=$HOME/.platformio"}
-: ${CBMOUNTS:="tasmota-build.mounts"}
-
-export BUILDER_IMAGE XBUILD_TARGET XBPROJECT_ROOT CC CXX XBCPREFIX CBVARS_ENV CBMOUNTS XBCRUNMIN XBC_VOLUMES
+source "$PROGDIR/cbconfvars.sh"
 
 # another fallback check for PATH containing the cross build forwarding scripts
 echo $PATH | grep -q xbc-fwd || export PATH="$XBPROJECT_ROOT/Toolchain/xbc-fwd":$PATH

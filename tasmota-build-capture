@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+# tasmota-build-capture -- Erfasst Speicherbelegungs-Daten aus einem Tasmota-Build-Log
+# und schreibt sie in eine CSV-Datei.
+#
+# Aufruf: tasmota-build-capture
+#
+# Das Script arbeitet immer relativ zu seinem eigenen Speicherort (PROGDIR).
+# Erwartet dort:
+#   docker-tasmota.log   -- Build-Log des letzten Build-Laufs
+#   Tasmota/             -- Git-Checkout des Tasmota-Quellcodes
+#
+# Ausgabe:
+#   tasmota-builds.csv   -- CSV-Datei mit allen erfassten Build-Daten (wird ergaenzt)
+#
+# Voraussetzungen: gawk, git
+
+# ---------------------------------------------------------------------------
+# Konfiguration
+# ---------------------------------------------------------------------------
+readonly CSV_FILENAME="tasmota-builds.csv"
+readonly TASMOTA_SUBDIR="Tasmota"
+readonly LOG_FILENAME="docker-tasmota.log"
+
+readonly CSV_HEADER="capture_timestamp,branch,commit_hash,commit_timestamp,target,platform_name,platform_version,platform_url,framework_url,status,build_duration_s,ram_used,ram_total,flash_used,flash_total,iram_used,iram_total,flash_code,flash_data,dram_used,dram_total,rtc_slow_used,rtc_slow_total"
+
+# ---------------------------------------------------------------------------
+# Initialisierung
+# ---------------------------------------------------------------------------
+PROGDIR="$(dirname "$(readlink -f "$0")")"
+readonly PROGDIR
+
+LOG_FILE="${PROGDIR}/${LOG_FILENAME}"
+CSV_FILE="${PROGDIR}/${CSV_FILENAME}"
+TASMOTA_DIR="${PROGDIR}/${TASMOTA_SUBDIR}"
+
+# ---------------------------------------------------------------------------
+# Hilfsfunktionen
+# ---------------------------------------------------------------------------
+die() {
+    echo "FEHLER: $*" >&2
+    exit 1
+}
+
+# Entfernt ANSI-Escape-Sequenzen und Carriage-Returns.
+# Unicode-Box-Zeichen der ESP32-Tabelle bleiben erhalten.
+stripAnsi() {
+    sed 's/\x1b\[[0-9;]*[mGKHF]//g
+         s/\x1b\[[?][0-9]*[lh]//g
+         s/\x1b\[[-0-9;]*[A-Za-z]//g
+         s/\r//g'
+}
+
+# ---------------------------------------------------------------------------
+# Voraussetzungen pruefen
+# ---------------------------------------------------------------------------
+[[ -f "${LOG_FILE}" ]]    || die "Log-Datei nicht gefunden: ${LOG_FILE}"
+[[ -d "${TASMOTA_DIR}" ]] || die "Tasmota-Verzeichnis nicht gefunden: ${TASMOTA_DIR}"
+command -v gawk >/dev/null || die "gawk nicht gefunden"
+command -v git  >/dev/null || die "git nicht gefunden"
+
+# ---------------------------------------------------------------------------
+# Git-Metadaten ermitteln
+# ---------------------------------------------------------------------------
+GIT_BRANCH="$(git -C "${TASMOTA_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null)" \
+    || die "Konnte Branch nicht ermitteln (kein Git-Repo in ${TASMOTA_DIR}?)"
+GIT_COMMIT="$(git -C "${TASMOTA_DIR}" rev-parse HEAD 2>/dev/null)" \
+    || die "Konnte Commit-Hash nicht ermitteln"
+GIT_COMMIT_TS="$(git -C "${TASMOTA_DIR}" log -1 --format=%cI HEAD 2>/dev/null)" \
+    || die "Konnte Commit-Zeitstempel nicht ermitteln"
+
+CAPTURE_TS="$(date -Iseconds)"
+
+# ---------------------------------------------------------------------------
+# Log parsen
+# ---------------------------------------------------------------------------
+# Unterstuetzte Formate:
+#
+# ESP8266 (z.B. tasmota-4M):
+#   Processing tasmota-4M (board: ...; platform: https://...; framework: arduino)
+#   PLATFORM: Espressif 8266 (2026.4.0) > ...
+#   RAM:   [=====     ]  51.5% (used 42152 bytes from 81920 bytes)
+#   Flash: [======    ]  64.4% (used 672676 bytes from 1044464 bytes)
+#   Used static IRAM: 30584 bytes ( 2184 remain, 93.3 % used)
+#   ===== [SUCCESS] Took 62.01 seconds =====
+#
+# ESP32 (z.B. tasmota32):
+#   Processing tasmota32 (framework: arduino; platform: https://...; board: esp32)
+#   PLATFORM: Espressif 32 (2026.5.50) > ...
+#   Detailtabelle mit: Flash Code, Flash Data, IRAM, DRAM, RTC SLOW
+#   RAM:   [==        ]  23.7% (used 77644 bytes from 327680 bytes)
+#   Flash: [=======   ]  71.8% (used 2116623 bytes from 2949120 bytes)
+#   ===== [SUCCESS] Took 458.19 seconds =====
+
+PARSED_LINES="$(stripAnsi < "${LOG_FILE}" | gawk \
+    -v branch="${GIT_BRANCH}" \
+    -v commit="${GIT_COMMIT}" \
+    -v commitTs="${GIT_COMMIT_TS}" \
+    -v captureTs="${CAPTURE_TS}" '
+
+function trimSpace(s) {
+    gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+    return s
+}
+
+
+function resetTarget() {
+    targetName      = ""
+    platformName    = ""
+    platformVersion = ""
+    platformUrl     = ""
+    frameworkUrl    = ""
+    buildDurationS  = ""
+    ramUsed         = ""
+    ramTotal        = ""
+    flashUsed       = ""
+    flashTotal      = ""
+    iramUsed        = ""
+    iramTotal       = ""
+    flashCode       = ""
+    flashData       = ""
+    dramUsed        = ""
+    dramTotal       = ""
+    rtcSlowUsed     = ""
+    rtcSlowTotal    = ""
+    inTarget        = 0
+}
+
+function emitRow(statusVal) {
+    printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+        captureTs, branch, commit, commitTs,
+        targetName, platformName, platformVersion, platformUrl, frameworkUrl,
+        statusVal, buildDurationS,
+        ramUsed, ramTotal, flashUsed, flashTotal,
+        iramUsed, iramTotal,
+        flashCode, flashData,
+        dramUsed, dramTotal,
+        rtcSlowUsed, rtcSlowTotal
+}
+
+BEGIN { resetTarget() }
+
+# --- Neues Target ---
+# "Processing tasmota-4M (board: esp8266_4M2M; platform: https://...; framework: arduino)"
+/^Processing / {
+    resetTarget()
+    n = split($0, words, /[[:space:]]+/)
+    targetName = words[2]
+    # Platform-URL aus der Processing-Zeile
+    if (match($0, /platform: (https:[^;)]+)/, arr))
+        platformUrl = trimSpace(arr[1])
+    inTarget = 1
+    next
+}
+
+inTarget == 0 { next }
+
+# --- PLATFORM-Zeile ---
+# "PLATFORM: Espressif 8266 (2026.4.0) > ..."
+/^PLATFORM:/ {
+    if (match($0, /PLATFORM: ([^(]+)\(([^)]+)\)/, arr)) {
+        platformName    = trimSpace(arr[1])
+        platformVersion = trimSpace(arr[2])
+    }
+    next
+}
+
+# --- Framework-Version: immer aus der PACKAGES-Liste lesen ---
+# " - framework-arduinoespressif32 @ 3.3.8+sha.f2a3fa2b"
+# " - framework-arduinoespressif8266 @ 2.7.8"
+# Diese Zeile erscheint in jedem Build, unabhaengig davon ob die Toolchain
+# neu heruntergeladen wurde oder gecacht war.
+/^[[:space:]]*-[[:space:]]+framework-arduinoespressif/ {
+    if (match($0, /framework-arduinoespressif[^[:space:]]+ @ [^[:space:]]+/, arr))
+        frameworkUrl = arr[0]
+    next
+}
+
+# --- ESP8266: RAM-Kurzzeile ---
+# "RAM:   [=====     ]  51.5% (used 42152 bytes from 81920 bytes)"
+/^RAM:[[:space:]]*\[/ {
+    if (match($0, /used ([0-9]+) bytes from ([0-9]+)/, arr)) {
+        ramUsed  = arr[1]
+        ramTotal = arr[2]
+    }
+    next
+}
+
+# --- ESP8266 + ESP32: Flash-Kurzzeile ---
+# "Flash: [======    ]  64.4% (used 672676 bytes from 1044464 bytes)"
+/^Flash:[[:space:]]*\[/ {
+    if (match($0, /used ([0-9]+) bytes from ([0-9]+)/, arr)) {
+        flashUsed  = arr[1]
+        flashTotal = arr[2]
+    }
+    next
+}
+
+# --- ESP8266: statisches IRAM ---
+# "Used static IRAM: 30584 bytes ( 2184 remain, 93.3 % used)"
+/^Used static IRAM:/ {
+    if (match($0, /IRAM: ([0-9]+) bytes[^0-9]+([0-9]+) remain/, arr)) {
+        iramUsed  = arr[1]
+        iramTotal = arr[1] + arr[2]
+    }
+    next
+}
+
+# --- ESP32-Detailtabelle ---
+# Zeilen enthalten Unicode-Box-Zeichen als Spaltentrennzeichen, z.B.:
+# "│ IRAM                │        90483 │     52.6 │          81549 │        172032 │"
+# "│ DRAM                │        77644 │    62.32 │          46936 │        124580 │"
+# "│ RTC SLOW            │          464 │    11.33 │           3632 │          4096 │"
+# "│ Flash Code          │      1386912 │          │                │               │"
+# "│ Flash Data          │       615748 │          │                │               │"
+#
+# Hinweis: Zeichenklassen [│┃...] sind in gawk mit Multibyte-UTF-8 nicht zuverlaessig.
+# Daher einzelne gsub-Aufrufe pro Box-Zeichen.
+/│/ {
+    line = $0
+    gsub(/│/, "|", line); gsub(/┃/, "|", line)
+    gsub(/┡/, "|", line); gsub(/┢/, "|", line)
+    gsub(/┩/, "|", line); gsub(/└/, "|", line)
+    n = split(line, cols, "|")
+    if (n < 3) next
+
+    label = trimSpace(cols[2])
+    used  = trimSpace(cols[3])
+    total = trimSpace(cols[6])   # col[4]=Used%, col[5]=Remain, col[6]=Total
+
+    if (used !~ /^[0-9]+$/) next
+
+    if (label == "IRAM") {
+        iramUsed  = used
+        if (total ~ /^[0-9]+$/) iramTotal = total
+    } else if (label == "DRAM") {
+        dramUsed  = used
+        if (total ~ /^[0-9]+$/) dramTotal = total
+    } else if (label == "RTC SLOW") {
+        rtcSlowUsed = used
+        if (total ~ /^[0-9]+$/) rtcSlowTotal = total
+    } else if (label == "Flash Code") {
+        flashCode = used
+    } else if (label == "Flash Data") {
+        flashData = used
+    }
+    next
+}
+
+# --- SUCCESS-Abschluss des Targets ---
+# "========================= [SUCCESS] Took 62.01 seconds ========================="
+# Dauer steht direkt in dieser Zeile als Dezimalzahl in Sekunden.
+/=+ \[.*SUCCESS.*\] Took/ {
+    if (match($0, /Took ([0-9]+\.[0-9]+) seconds/, arr))
+        buildDurationS = int(arr[1])
+    else if (match($0, /Took ([0-9]+) seconds/, arr))
+        buildDurationS = arr[1]
+    emitRow("SUCCESS")
+    resetTarget()
+    next
+}
+
+# --- FAILED-Abschluss: nicht erfassen ---
+/=+ \[.*FAILED.*\] Took/ {
+    resetTarget()
+    next
+}
+')"
+
+# ---------------------------------------------------------------------------
+# Ergebnis pruefen
+# ---------------------------------------------------------------------------
+if [[ -z "${PARSED_LINES}" ]]; then
+    die "Keine erfolgreichen Build-Targets im Log gefunden: ${LOG_FILE}"
+fi
+
+# ---------------------------------------------------------------------------
+# CSV schreiben
+# ---------------------------------------------------------------------------
+if [[ ! -f "${CSV_FILE}" ]]; then
+    echo "${CSV_HEADER}" > "${CSV_FILE}" \
+        || die "Konnte CSV-Datei nicht anlegen: ${CSV_FILE}"
+fi
+
+echo "${PARSED_LINES}" >> "${CSV_FILE}" \
+    || die "Konnte nicht in CSV-Datei schreiben: ${CSV_FILE}"
+
+# ---------------------------------------------------------------------------
+# Bestaetigung
+# ---------------------------------------------------------------------------
+lineCount="$(echo "${PARSED_LINES}" | wc -l | tr -d ' ')"
+echo "Erfasst: ${lineCount} Target(s) fuer Branch '${GIT_BRANCH}' @ ${GIT_COMMIT:0:8} -> ${CSV_FILE}"

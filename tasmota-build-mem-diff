@@ -1,0 +1,454 @@
+#!/usr/bin/env bash
+# tasmota-build-mem-diff -- Vergleicht Speicherbelegungen zweier Tasmota-Builds
+# aus der CSV-Datenbank, die tasmota-build-capture erzeugt.
+#
+# Aufruf: tasmota-build-mem-diff [OPTIONEN] [feature-branch [ref-branch]]
+#
+# Argumente:
+#   feature-branch   Branch des Feature-Builds (Default: juengster Non-development-Branch)
+#   ref-branch       Branch des Referenz-Builds (Default: development)
+#
+# Optionen:
+#   --plain          Einfache Textausgabe (Default)
+#   --markdown       Markdown-Tabelle
+#   --rst            reStructuredText-Grid-Tabelle
+#   -h, --help       Hilfe
+#
+# Voraussetzungen: gawk, git
+
+# ---------------------------------------------------------------------------
+# Konfiguration
+# ---------------------------------------------------------------------------
+readonly CSV_FILENAME="tasmota-builds.csv"
+readonly REF_BRANCH_DEFAULT="development"
+# Maximaler Zeitabstand zwischen Feature- und Referenz-Build in Sekunden.
+# Bei Ueberschreitung wird gewarnt. 3600 = 1 Stunde.
+readonly MAX_BUILD_AGE_DIFF_S=3600
+
+# ---------------------------------------------------------------------------
+# Initialisierung
+# ---------------------------------------------------------------------------
+PROGDIR="$(dirname "$(readlink -f "$0")")"
+readonly PROGDIR
+
+CSV_FILE="${PROGDIR}/${CSV_FILENAME}"
+
+# ---------------------------------------------------------------------------
+# Hilfsfunktionen
+# ---------------------------------------------------------------------------
+die() {
+    echo "FEHLER: $*" >&2
+    exit 1
+}
+
+warn() {
+    echo "WARNUNG: $*" >&2
+}
+
+usage() {
+    sed -n '/^# Aufruf:/,/^$/p' "$0" | grep '^#' | sed 's/^# \{0,1\}//'
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
+# Argumente parsen
+# ---------------------------------------------------------------------------
+OUTPUT_FORMAT="plain"
+FEATURE_BRANCH=""
+REF_BRANCH=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --plain)    OUTPUT_FORMAT="plain";    shift ;;
+        --markdown) OUTPUT_FORMAT="markdown"; shift ;;
+        --rst)      OUTPUT_FORMAT="rst";      shift ;;
+        -h|--help)  usage ;;
+        -*)         die "Unbekannte Option: $1" ;;
+        *)
+            if   [[ -z "${FEATURE_BRANCH}" ]]; then FEATURE_BRANCH="$1"
+            elif [[ -z "${REF_BRANCH}"     ]]; then REF_BRANCH="$1"
+            else die "Zu viele Argumente: $1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# Voraussetzungen pruefen
+# ---------------------------------------------------------------------------
+[[ -f "${CSV_FILE}" ]] || die "CSV-Datei nicht gefunden: ${CSV_FILE}"
+command -v gawk >/dev/null || die "gawk nicht gefunden"
+
+# ---------------------------------------------------------------------------
+# CSV einlesen und Branches/Daten ermitteln (gawk)
+# ---------------------------------------------------------------------------
+# Spaltenindex-Mapping (1-basiert, entspricht CSV_HEADER in tasmota-build-capture):
+#  1  capture_timestamp
+#  2  branch
+#  3  commit_hash
+#  4  commit_timestamp
+#  5  target
+#  6  platform_name
+#  7  platform_version
+#  8  platform_url
+#  9  framework_url
+# 10  status
+# 11  build_duration_s
+# 12  ram_used
+# 13  ram_total
+# 14  flash_used
+# 15  flash_total
+# 16  iram_used
+# 17  iram_total
+# 18  flash_code
+# 19  flash_data
+# 20  dram_used
+# 21  dram_total
+# 22  rtc_slow_used
+# 23  rtc_slow_total
+
+QUERY_RESULT="$(gawk \
+    -v featureBranch="${FEATURE_BRANCH}" \
+    -v refBranch="${REF_BRANCH}" \
+    -v refDefault="${REF_BRANCH_DEFAULT}" \
+    -v MAX_BUILD_AGE_DIFF="${MAX_BUILD_AGE_DIFF_S}" \
+    'BEGIN {
+        FS = ","
+        # Indizes der CSV-Spalten
+        COL_CAPTURE_TS   =  1
+        COL_BRANCH       =  2
+        COL_COMMIT       =  3
+        COL_COMMIT_TS    =  4
+        COL_TARGET       =  5
+        COL_PLAT_NAME    =  6
+        COL_PLAT_VER     =  7
+        COL_PLAT_URL     =  8
+        COL_FW_URL       =  9
+        COL_STATUS       = 10
+        COL_DURATION     = 11
+        COL_RAM_USED     = 12
+        COL_RAM_TOTAL    = 13
+        COL_FLASH_USED   = 14
+        COL_FLASH_TOTAL  = 15
+        COL_IRAM_USED    = 16
+        COL_IRAM_TOTAL   = 17
+        COL_FLASH_CODE   = 18
+        COL_FLASH_DATA   = 19
+        COL_DRAM_USED    = 20
+        COL_DRAM_TOTAL   = 21
+        COL_RTC_USED     = 22
+        COL_RTC_TOTAL    = 23
+    }
+
+    NR == 1 { next }   # Header ueberspringen
+
+    $COL_STATUS != "SUCCESS" { next }
+
+    {
+        branch     = $COL_BRANCH
+        captureTs  = $COL_CAPTURE_TS
+        commitHash = $COL_COMMIT
+        commitTs   = $COL_COMMIT_TS
+        target     = $COL_TARGET
+
+        # Neuesten Capture-Zeitstempel pro Branch merken
+        if (captureTs > latestCapture[branch]) {
+            latestCapture[branch] = captureTs
+            latestCommit[branch]  = commitHash
+            latestCommitTs[branch]= commitTs
+        }
+
+        # Alle bekannten Branches sammeln (ausser refDefault)
+        if (branch != refDefault)
+            knownNonRef[branch] = 1
+
+        # Daten pro Branch+Target speichern (neuester Capture gewinnt)
+        key = branch SUBSEP target
+        if (captureTs >= rowCapture[key]) {
+            rowCapture[key]    = captureTs
+            rowCommit[key]     = commitHash
+            rowCommitTs[key]   = commitTs
+            rowPlatName[key]   = $COL_PLAT_NAME
+            rowPlatVer[key]    = $COL_PLAT_VER
+            rowPlatUrl[key]    = $COL_PLAT_URL
+            rowFwUrl[key]      = $COL_FW_URL
+            rowRamUsed[key]    = $COL_RAM_USED
+            rowRamTotal[key]   = $COL_RAM_TOTAL
+            rowFlashUsed[key]  = $COL_FLASH_USED
+            rowFlashTotal[key] = $COL_FLASH_TOTAL
+            rowIramUsed[key]   = $COL_IRAM_USED
+            rowIramTotal[key]  = $COL_IRAM_TOTAL
+        }
+
+        # Mehrere Platform-Versionen pro Branch+Commit+Target erkennen
+        verKey = branch SUBSEP commitHash SUBSEP target SUBSEP $COL_PLAT_VER SUBSEP $COL_FW_URL
+        seenVersions[verKey] = 1
+    }
+
+    END {
+        # Referenz-Branch bestimmen
+        if (refBranch == "")
+            refBranch = refDefault
+
+        # Feature-Branch bestimmen: juengster Non-ref-Branch
+        if (featureBranch == "") {
+            bestTs = ""
+            for (b in knownNonRef) {
+                if (b == refBranch) continue
+                if (latestCapture[b] > bestTs) {
+                    bestTs       = latestCapture[b]
+                    featureBranch = b
+                }
+            }
+            if (featureBranch == "") {
+                print "ERROR:Kein Non-" refBranch "-Branch in der CSV gefunden"
+                exit 1
+            }
+        }
+
+        # Pruefen ob beide Branches vorhanden sind
+        if (!(refBranch in latestCapture)) {
+            print "ERROR:Branch nicht in CSV: " refBranch
+            exit 1
+        }
+        if (!(featureBranch in latestCapture)) {
+            print "ERROR:Branch nicht in CSV: " featureBranch
+            exit 1
+        }
+
+        # Capture-Zeitstempel der neuesten Builds vergleichen (nicht Commit-Zeitstempel).
+        # Der Commit-Zeitstempel misst den Abstand der Commits, nicht den der Build-Laeufe.
+        refCaptureTs     = latestCapture[refBranch]
+        featureCaptureTs = latestCapture[featureBranch]
+
+        if (refCaptureTs > featureCaptureTs)
+            diffS = isoToEpoch(refCaptureTs) - isoToEpoch(featureCaptureTs)
+        else
+            diffS = isoToEpoch(featureCaptureTs) - isoToEpoch(refCaptureTs)
+
+        timewarnMsg = ""
+        if (diffS > MAX_BUILD_AGE_DIFF + 0) {
+            h = int(diffS / 3600)
+            m = int((diffS % 3600) / 60)
+            timewarnMsg = sprintf("WARN:Zeitabstand zwischen Builds: %dh %02dm", h, m)
+        }
+
+        # Warnung: mehrere Platform-Versionen fuer denselben Commit
+        for (vk in seenVersions) {
+            split(vk, vp, SUBSEP)
+            b = vp[1]; ch = vp[2]; tgt = vp[3]
+            multiKey = b SUBSEP ch SUBSEP tgt
+            multiCount[multiKey]++
+        }
+        platWarnMsg = ""
+        for (mk in multiCount) {
+            if (multiCount[mk] > 1) {
+                split(mk, mp, SUBSEP)
+                platWarnMsg = platWarnMsg "WARN:Mehrere Platform-Versionen fuer " \
+                              mp[1] " @ " substr(mp[2],1,8) " Target " mp[3] "\n"
+            }
+        }
+
+        # Alle Targets der beiden Branches sammeln
+        for (key in rowCommit) {
+            split(key, kp, SUBSEP)
+            b = kp[1]; tgt = kp[2]
+            if (b == refBranch || b == featureBranch)
+                allTargets[tgt] = 1
+        }
+
+        # Metadaten-Abweichungen erkennen
+        metaWarnMsg = ""
+        for (tgt in allTargets) {
+            rk = refBranch     SUBSEP tgt
+            fk = featureBranch SUBSEP tgt
+            if ((rk in rowPlatVer) && (fk in rowPlatVer)) {
+                if (rowPlatVer[rk] != rowPlatVer[fk])
+                    metaWarnMsg = metaWarnMsg "WARN:Platform-Version unterschiedlich fuer " tgt \
+                                  ": ref=" rowPlatVer[rk] " feature=" rowPlatVer[fk] "\n"
+                refFwVer  = fwVersion(rowFwUrl[rk])
+                featFwVer = fwVersion(rowFwUrl[fk])
+                if (rowFwUrl[rk] != "" && rowFwUrl[fk] != "" && refFwVer != featFwVer)
+                    metaWarnMsg = metaWarnMsg "WARN:Framework-Version unterschiedlich fuer " tgt \
+                                  ": ref=" refFwVer " feature=" featFwVer "\n"
+            }
+        }
+
+        # Ausgabe-Header
+        print "REF_BRANCH:"     refBranch
+        print "REF_COMMIT:"     latestCommit[refBranch]
+        print "REF_COMMIT_TS:"  latestCommitTs[refBranch]
+        print "FEAT_BRANCH:"    featureBranch
+        print "FEAT_COMMIT:"    latestCommit[featureBranch]
+        print "FEAT_COMMIT_TS:" latestCommitTs[featureBranch]
+        if (timewarnMsg != "") print timewarnMsg
+        if (platWarnMsg != "") printf "%s", platWarnMsg
+        if (metaWarnMsg != "") printf "%s", metaWarnMsg
+        print "---"
+
+        # Datenzeilen: TARGET RAM_REF RAM_FEAT RAM_DIFF FLASH_REF FLASH_FEAT FLASH_DIFF IRAM_REF IRAM_FEAT IRAM_DIFF
+        # "n/a" wenn ein Wert nicht vorhanden ist
+        for (tgt in allTargets) {
+            rk = refBranch     SUBSEP tgt
+            fk = featureBranch SUBSEP tgt
+
+            ramRef   = (rk in rowRamUsed)   ? rowRamUsed[rk]   : "n/a"
+            ramFeat  = (fk in rowRamUsed)    ? rowRamUsed[fk]   : "n/a"
+            flashRef = (rk in rowFlashUsed)  ? rowFlashUsed[rk] : "n/a"
+            flashFeat= (fk in rowFlashUsed)  ? rowFlashUsed[fk] : "n/a"
+            iramRef  = (rk in rowIramUsed)   ? rowIramUsed[rk]  : "n/a"
+            iramFeat = (fk in rowIramUsed)   ? rowIramUsed[fk]  : "n/a"
+
+            ramDiff   = (ramRef   != "n/a" && ramFeat  != "n/a") ? ramFeat  - ramRef   : "n/a"
+            flashDiff = (flashRef != "n/a" && flashFeat!= "n/a") ? flashFeat- flashRef : "n/a"
+            iramDiff  = (iramRef  != "n/a" && iramFeat != "n/a") ? iramFeat - iramRef  : "n/a"
+
+            # Vorzeichen fuer Diff-Werte
+            if (ramDiff   != "n/a" && ramDiff   > 0) ramDiff   = "+" ramDiff
+            if (flashDiff != "n/a" && flashDiff > 0) flashDiff = "+" flashDiff
+            if (iramDiff  != "n/a" && iramDiff  > 0) iramDiff  = "+" iramDiff
+
+            printf "DATA:%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+                tgt,
+                ramRef, ramFeat, ramDiff,
+                flashRef, flashFeat, flashDiff,
+                iramRef, iramFeat, iramDiff
+        }
+    }
+
+    # Hilfsfunktion: Versionsnummer aus PACKAGES-Eintrag extrahieren.
+    # "framework-arduinoespressif32 @ 3.3.8+sha.f2a3fa2b" -> "3.3.8+sha.f2a3fa2b"
+    # Gibt den Rohwert zurueck wenn kein @-Muster erkannt wird.
+    function fwVersion(s,    a) {
+        if (match(s, /@ ([^[:space:]]+)/, a)) return a[1]
+        return s
+    }
+
+    # Hilfsfunktion: ISO-8601 -> Unix-Epoch (vereinfacht, ignoriert Zeitzone)
+    # Reicht fuer den Zeitabstands-Vergleich in der gleichen Zeitzone.
+    function isoToEpoch(ts,    y,mo,d,h,mi,s) {
+        # "2026-05-16T14:32:01+02:00" oder "2026-05-16T14:32:01Z"
+        gsub(/[-:TZ]/, " ", ts)
+        split(ts, p, " ")
+        y=p[1]+0; mo=p[2]+0; d=p[3]+0; h=p[4]+0; mi=p[5]+0; s=p[6]+0
+        # Vereinfachte Epoch-Berechnung (keine Schaltjahr-Praezision noetig)
+        return ((y-1970)*365.25*86400) + (mo*30.44*86400) + (d*86400) + (h*3600) + (mi*60) + s
+    }
+' "${CSV_FILE}")"
+
+# ---------------------------------------------------------------------------
+# Fehler aus der gawk-Ausgabe abfangen
+# ---------------------------------------------------------------------------
+if echo "${QUERY_RESULT}" | grep -q '^ERROR:'; then
+    errMsg="$(echo "${QUERY_RESULT}" | grep '^ERROR:' | sed 's/^ERROR://')"
+    die "${errMsg}"
+fi
+
+# ---------------------------------------------------------------------------
+# Warnungen ausgeben
+# ---------------------------------------------------------------------------
+echo "${QUERY_RESULT}" | grep '^WARN:' | sed 's/^WARN:/WARNUNG: /' >&2
+
+# ---------------------------------------------------------------------------
+# Metadaten extrahieren
+# ---------------------------------------------------------------------------
+refBranch="$(  echo "${QUERY_RESULT}" | grep '^REF_BRANCH:'    | cut -d: -f2)"
+refCommit="$(  echo "${QUERY_RESULT}" | grep '^REF_COMMIT:'    | cut -d: -f2 | cut -c1-8)"
+refCommitTs="$(echo "${QUERY_RESULT}" | grep '^REF_COMMIT_TS:' | cut -d: -f2-)"
+featBranch="$( echo "${QUERY_RESULT}" | grep '^FEAT_BRANCH:'   | cut -d: -f2)"
+featCommit="$( echo "${QUERY_RESULT}" | grep '^FEAT_COMMIT:'   | cut -d: -f2 | cut -c1-8)"
+featCommitTs="$(echo "${QUERY_RESULT}"| grep '^FEAT_COMMIT_TS:'| cut -d: -f2-)"
+
+# Timestamp auf Datum+Uhrzeit kuerzen (ohne Sekunden-Offset)
+refTs="$(  echo "${refCommitTs}"  | sed 's/T/ /; s/\(.\{16\}\).*/\1/')"
+featTs="$( echo "${featCommitTs}" | sed 's/T/ /; s/\(.\{16\}\).*/\1/')"
+
+# ---------------------------------------------------------------------------
+# Datenzeilen extrahieren und sortiert ausgeben
+# ---------------------------------------------------------------------------
+mapfile -t DATA_LINES < <(echo "${QUERY_RESULT}" | grep '^DATA:' | sed 's/^DATA://' | sort)
+
+# Felder pro Datenzeile (tab-getrennt):
+# 0:target 1:ram_ref 2:ram_feat 3:ram_diff 4:flash_ref 5:flash_feat 6:flash_diff 7:iram_ref 8:iram_feat 9:iram_diff
+
+# ---------------------------------------------------------------------------
+# Ausgabe erzeugen
+# ---------------------------------------------------------------------------
+
+outputPlain() {
+    echo "Ref:     ${refBranch} @ ${refCommit} (${refTs})"
+    echo "Feature: ${featBranch} @ ${featCommit} (${featTs})"
+    echo ""
+    for line in "${DATA_LINES[@]}"; do
+        IFS=$'\t' read -r target ramRef ramFeat ramDiff flashRef flashFeat flashDiff iramRef iramFeat iramDiff <<< "${line}"
+        printf "%-20s  RAM: %7s  IRAM: %7s  Flash: %7s\n" \
+            "${target}" "${ramDiff}" "${iramDiff}" "${flashDiff}"
+    done
+}
+
+outputMarkdown() {
+    echo "## Memory comparison: \`${refBranch}\` → \`${featBranch}\`"
+    echo ""
+    # Tabellenheader
+    printf "| %-20s | %12s | %12s | %12s |\n" "Target" "RAM [bytes]" "IRAM [bytes]" "Flash [bytes]"
+    printf "|%s|%s|%s|%s|\n" \
+        "$(printf '%0.s-' {1..22})" \
+        "$(printf '%0.s-' {1..14})" \
+        "$(printf '%0.s-' {1..14})" \
+        "$(printf '%0.s-' {1..14})"
+    for line in "${DATA_LINES[@]}"; do
+        IFS=$'\t' read -r target ramRef ramFeat ramDiff flashRef flashFeat flashDiff iramRef iramFeat iramDiff <<< "${line}"
+        printf "| %-20s | %12s | %12s | %12s |\n" \
+            "${target}" "${ramDiff}" "${iramDiff}" "${flashDiff}"
+    done
+    echo ""
+    echo "Ref:     \`${refBranch}\` @ \`${refCommit}\` (${refTs})"
+    echo "Feature: \`${featBranch}\` @ \`${featCommit}\` (${featTs})"
+}
+
+outputRst() {
+    # Spaltenbreiten: colX = Inhalt + 2 Leerzeichen Padding.
+    # Header "RAM [bytes]" hat 11 Zeichen -> colRam=13 (11+2).
+    # Header "IRAM [bytes]" hat 12 Zeichen -> colIram=14.
+    # Header "Flash [bytes]" hat 13 Zeichen -> colFlash=15.
+    local colTarget=22 colRam=13 colIram=14 colFlash=15
+    for line in "${DATA_LINES[@]}"; do
+        IFS=$'\t' read -r target _ _ ramDiff _ _ flashDiff _ _ iramDiff <<< "${line}"
+        local tlen=$(( ${#target} + 2 ))
+        (( tlen > colTarget )) && colTarget=${tlen}
+    done
+
+    # RST-Grid-Tabellen-Hilfsfunktionen
+    rstHRule() { # char col1 col2 col3 col4
+        local c="$1"
+        printf "+%s+%s+%s+%s+\n" \
+            "$(printf "%${colTarget}s" | tr ' ' "${c}")" \
+            "$(printf "%${colRam}s"    | tr ' ' "${c}")" \
+            "$(printf "%${colIram}s"   | tr ' ' "${c}")" \
+            "$(printf "%${colFlash}s"  | tr ' ' "${c}")"
+    }
+    rstRow() {
+        printf "| %-$((colTarget-2))s | %$((colRam-2))s | %$((colIram-2))s | %$((colFlash-2))s |\n" "$1" "$2" "$3" "$4"
+    }
+
+    echo "Memory comparison: ``${refBranch}`` → ``${featBranch}``"
+    echo ""
+    rstHRule "-"
+    rstRow "Target" "RAM [bytes]" "IRAM [bytes]" "Flash [bytes]"
+    rstHRule "="
+    for line in "${DATA_LINES[@]}"; do
+        IFS=$'\t' read -r target ramRef ramFeat ramDiff flashRef flashFeat flashDiff iramRef iramFeat iramDiff <<< "${line}"
+        rstRow "${target}" "${ramDiff}" "${iramDiff}" "${flashDiff}"
+        rstHRule "-"
+    done
+    echo ""
+    echo "| Ref:     ``${refBranch}`` @ ``${refCommit}`` (${refTs})"
+    echo "| Feature: ``${featBranch}`` @ ``${featCommit}`` (${featTs})"
+}
+
+case "${OUTPUT_FORMAT}" in
+    plain)    outputPlain    ;;
+    markdown) outputMarkdown ;;
+    rst)      outputRst      ;;
+esac

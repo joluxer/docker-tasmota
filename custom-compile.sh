@@ -164,10 +164,8 @@ if [[ $# -gt 0 ]]; then
           (
             shopt -s nullglob
             printf '%s\n' \
-              "${src_pattern}.bin" \
-              "${src_pattern}"-*.bin \
-              "${src_pattern}.bin.gz" \
-              "${src_pattern}"-*.bin.gz \
+              "${src_pattern}"*.bin \
+              "${src_pattern}"*.bin.gz \
               "${src_pattern}"*.elf \
               "${map_pattern}"*.map*
           ) | sort -u
